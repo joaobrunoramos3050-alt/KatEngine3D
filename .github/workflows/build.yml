@@ -1,1 +1,540 @@
+name: Compilar APK
 
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Gerar projeto Android
+        run: |
+          cat > settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+              plugins { id 'com.android.application' version '8.5.2' }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'MobileEngine'
+          include ':app'
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle <<'EOF_FILE'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'com.meuapp.engine'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.meuapp.engine'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+                  ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
+              }
+              externalNativeBuild {
+                  cmake { path 'src/main/cpp/CMakeLists.txt' }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+            <application android:label="MobileEngine" android:hasCode="false">
+              <activity android:name="android.app.NativeActivity"
+                        android:exported="true"
+                        android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+                        android:configChanges="orientation|screenSize|keyboardHidden">
+                <meta-data android:name="android.app.lib_name" android:value="mobileengine" />
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/CMakeLists.txt <<'EOF_FILE'
+          cmake_minimum_required(VERSION 3.22)
+          project(MobileEngine LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 17)
+
+          set(APP_GLUE ${ANDROID_NDK}/sources/android/native_app_glue)
+          add_library(native_app_glue STATIC ${APP_GLUE}/android_native_app_glue.c)
+          target_include_directories(native_app_glue PUBLIC ${APP_GLUE})
+
+          add_library(mobileengine SHARED Engine.cpp android_main.cpp)
+          target_link_libraries(mobileengine native_app_glue android EGL GLESv3 log)
+          set_target_properties(mobileengine PROPERTIES LINK_FLAGS "-u ANativeActivity_onCreate")
+          EOF_FILE
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/Math.h <<'EOF_FILE'
+          #pragma once
+          #include <cmath>
+
+          namespace eng {
+
+          struct Vec3 {
+              float x = 0, y = 0, z = 0;
+              Vec3() = default;
+              Vec3(float x, float y, float z) : x(x), y(y), z(z) {}
+              Vec3 operator+(Vec3 o) const { return {x + o.x, y + o.y, z + o.z}; }
+              Vec3 operator-(Vec3 o) const { return {x - o.x, y - o.y, z - o.z}; }
+              Vec3 operator*(float s) const { return {x * s, y * s, z * s}; }
+          };
+          inline float dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+          inline Vec3 cross(Vec3 a, Vec3 b) {
+              return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+          }
+          inline Vec3 normalize(Vec3 v) {
+              float l = std::sqrt(dot(v, v));
+              return l > 0 ? v * (1.0f / l) : v;
+          }
+
+          // Column-major (formato do OpenGL): m[coluna*4 + linha]
+          struct Mat4 {
+              float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+              static Mat4 translate(Vec3 t) { Mat4 r; r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z; return r; }
+              static Mat4 scale(Vec3 s) { Mat4 r; r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z; return r; }
+              static Mat4 rotX(float a) { Mat4 r; float c = std::cos(a), s = std::sin(a);
+                  r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c; return r; }
+              static Mat4 rotY(float a) { Mat4 r; float c = std::cos(a), s = std::sin(a);
+                  r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c; return r; }
+              static Mat4 rotZ(float a) { Mat4 r; float c = std::cos(a), s = std::sin(a);
+                  r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c; return r; }
+
+              static Mat4 perspective(float fovy, float aspect, float n, float f) {
+                  Mat4 r; for (float& v : r.m) v = 0;
+                  float t = 1.0f / std::tan(fovy * 0.5f);
+                  r.m[0] = t / aspect; r.m[5] = t;
+                  r.m[10] = (f + n) / (n - f); r.m[11] = -1;
+                  r.m[14] = 2 * f * n / (n - f);
+                  return r;
+              }
+              static Mat4 lookAt(Vec3 eye, Vec3 center, Vec3 up) {
+                  Vec3 f = normalize(center - eye), s = normalize(cross(f, up)), u = cross(s, f);
+                  Mat4 r;
+                  r.m[0] = s.x; r.m[4] = s.y; r.m[8] = s.z;
+                  r.m[1] = u.x; r.m[5] = u.y; r.m[9] = u.z;
+                  r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+                  r.m[12] = -dot(s, eye); r.m[13] = -dot(u, eye); r.m[14] = dot(f, eye);
+                  return r;
+              }
+              Mat4 operator*(const Mat4& b) const {
+                  Mat4 r;
+                  for (int c = 0; c < 4; ++c)
+                      for (int row = 0; row < 4; ++row) {
+                          float s = 0;
+                          for (int k = 0; k < 4; ++k) s += m[k * 4 + row] * b.m[c * 4 + k];
+                          r.m[c * 4 + row] = s;
+                      }
+                  return r;
+              }
+          };
+
+          } // namespace eng
+          EOF_FILE
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/Engine.h <<'EOF_FILE'
+          #pragma once
+          #include <GLES3/gl3.h>
+          #include <cstdint>
+          #include <functional>
+          #include <memory>
+          #include <string>
+          #include <vector>
+          #include "Math.h"
+
+          namespace eng {
+
+          struct Vertex { Vec3 pos, normal; };
+
+          class Shader {
+          public:
+              ~Shader() { if (id) glDeleteProgram(id); }
+              bool build(const char* vs, const char* fs);
+              void use() const { glUseProgram(id); }
+              GLint loc(const char* name) const { return glGetUniformLocation(id, name); }
+              GLuint id = 0;
+          };
+
+          class Mesh {
+          public:
+              Mesh() = default;
+              Mesh(const Mesh&) = delete;
+              Mesh& operator=(const Mesh&) = delete;
+              ~Mesh();
+              void upload(const std::vector<Vertex>& v, const std::vector<uint16_t>& idx);
+              void draw() const;
+              static std::shared_ptr<Mesh> cube();
+              static std::shared_ptr<Mesh> sphere(int stacks = 24, int slices = 32);
+          private:
+              GLuint vao = 0, vbo = 0, ebo = 0;
+              GLsizei count = 0;
+          };
+
+          struct Entity {
+              std::string name;
+              Vec3 pos, rot, scale{1, 1, 1}, color{1, 1, 1};
+              std::shared_ptr<Mesh> mesh;
+              std::function<void(Entity&, float time, float dt)> onUpdate; // "script" do objeto
+              Mat4 model() const {
+                  return Mat4::translate(pos) * Mat4::rotY(rot.y) * Mat4::rotX(rot.x) *
+                         Mat4::rotZ(rot.z) * Mat4::scale(scale);
+              }
+          };
+
+          struct Camera {
+              Vec3 target{0, 0, 0};
+              float yaw = 0.6f, pitch = 0.45f, dist = 9.0f, fov = 1.05f;
+          };
+
+          class Engine {
+          public:
+              bool init();                       // cria recursos de GPU + cena demo
+              void resize(int w, int h);
+              void frame(float dt);              // update + render
+              void onDrag(float dx, float dy);   // 1 dedo: orbita a câmera
+              void onZoom(float delta);          // 2 dedos: zoom
+
+              Entity& add(const std::string& name, std::shared_ptr<Mesh> mesh, Vec3 pos, Vec3 color);
+              Camera camera;
+              Vec3 lightDir{-0.4f, -1.0f, -0.6f};
+
+          private:
+              void render();
+              Shader shader_;
+              std::vector<std::unique_ptr<Entity>> entities_;
+              int w_ = 1, h_ = 1;
+              float time_ = 0;
+          };
+
+          } // namespace eng
+          EOF_FILE
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/Engine.cpp <<'EOF_FILE'
+          #include "Engine.h"
+          #include <android/log.h>
+          #include <algorithm>
+          #include <array>
+          #include <cstddef>
+
+          #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "MobileEngine", __VA_ARGS__)
+
+          namespace eng {
+
+          static const char* kVS = R"(#version 300 es
+          layout(location=0) in vec3 aPos;
+          layout(location=1) in vec3 aNormal;
+          uniform mat4 uVP;
+          uniform mat4 uModel;
+          out vec3 vNormal;
+          void main() {
+              vNormal = mat3(uModel) * aNormal;   // ok para escala uniforme
+              gl_Position = uVP * uModel * vec4(aPos, 1.0);
+          })";
+
+          static const char* kFS = R"(#version 300 es
+          precision mediump float;
+          in vec3 vNormal;
+          uniform vec3 uColor;
+          uniform vec3 uLightDir;
+          out vec4 outColor;
+          void main() {
+              float d = max(dot(normalize(vNormal), -normalize(uLightDir)), 0.0);
+              outColor = vec4(uColor * (0.25 + 0.75 * d), 1.0);
+          })";
+
+          static GLuint compile(GLenum type, const char* src) {
+              GLuint s = glCreateShader(type);
+              glShaderSource(s, 1, &src, nullptr);
+              glCompileShader(s);
+              GLint ok = 0;
+              glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+              if (!ok) { char log[512]; glGetShaderInfoLog(s, 512, nullptr, log); LOG("shader: %s", log); }
+              return s;
+          }
+
+          bool Shader::build(const char* vs, const char* fs) {
+              GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
+              id = glCreateProgram();
+              glAttachShader(id, v); glAttachShader(id, f);
+              glLinkProgram(id);
+              glDeleteShader(v); glDeleteShader(f);
+              GLint ok = 0;
+              glGetProgramiv(id, GL_LINK_STATUS, &ok);
+              if (!ok) { char log[512]; glGetProgramInfoLog(id, 512, nullptr, log); LOG("link: %s", log); }
+              return ok;
+          }
+
+          Mesh::~Mesh() {
+              if (vao) glDeleteVertexArrays(1, &vao);
+              if (vbo) glDeleteBuffers(1, &vbo);
+              if (ebo) glDeleteBuffers(1, &ebo);
+          }
+
+          void Mesh::upload(const std::vector<Vertex>& v, const std::vector<uint16_t>& idx) {
+              glGenVertexArrays(1, &vao);
+              glGenBuffers(1, &vbo);
+              glGenBuffers(1, &ebo);
+              glBindVertexArray(vao);
+              glBindBuffer(GL_ARRAY_BUFFER, vbo);
+              glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(Vertex), v.data(), GL_STATIC_DRAW);
+              glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+              glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * sizeof(uint16_t), idx.data(), GL_STATIC_DRAW);
+              glEnableVertexAttribArray(0);
+              glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, pos));
+              glEnableVertexAttribArray(1);
+              glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, normal));
+              glBindVertexArray(0);
+              count = (GLsizei)idx.size();
+          }
+
+          void Mesh::draw() const {
+              glBindVertexArray(vao);
+              glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, nullptr);
+          }
+
+          std::shared_ptr<Mesh> Mesh::cube() {
+              struct Face { Vec3 n, u, v; };
+              const Face faces[6] = {
+                  {{1, 0, 0}, {0, 0, -1}, {0, 1, 0}},  {{-1, 0, 0}, {0, 0, 1}, {0, 1, 0}},
+                  {{0, 1, 0}, {1, 0, 0}, {0, 0, -1}},  {{0, -1, 0}, {1, 0, 0}, {0, 0, 1}},
+                  {{0, 0, 1}, {1, 0, 0}, {0, 1, 0}},   {{0, 0, -1}, {-1, 0, 0}, {0, 1, 0}}};
+              std::vector<Vertex> v; std::vector<uint16_t> idx;
+              for (const Face& f : faces) {
+                  uint16_t b = (uint16_t)v.size();
+                  Vec3 c = f.n * 0.5f, u = f.u * 0.5f, w = f.v * 0.5f;
+                  v.push_back({c - u - w, f.n}); v.push_back({c + u - w, f.n});
+                  v.push_back({c + u + w, f.n}); v.push_back({c - u + w, f.n});
+                  for (int i : {0, 1, 2, 0, 2, 3}) idx.push_back(b + i);
+              }
+              auto m = std::make_shared<Mesh>();
+              m->upload(v, idx);
+              return m;
+          }
+
+          std::shared_ptr<Mesh> Mesh::sphere(int stacks, int slices) {
+              std::vector<Vertex> v; std::vector<uint16_t> idx;
+              const float PI = 3.14159265f;
+              for (int i = 0; i <= stacks; ++i) {
+                  float phi = PI * i / stacks;
+                  for (int j = 0; j <= slices; ++j) {
+                      float th = 2 * PI * j / slices;
+                      Vec3 n{std::sin(phi) * std::cos(th), std::cos(phi), std::sin(phi) * std::sin(th)};
+                      v.push_back({n * 0.5f, n});
+                  }
+              }
+              for (int i = 0; i < stacks; ++i)
+                  for (int j = 0; j < slices; ++j) {
+                      uint16_t a = (uint16_t)(i * (slices + 1) + j), b = (uint16_t)(a + slices + 1);
+                      for (int k : {0, 1, 2}) idx.push_back(std::array<uint16_t, 3>{a, (uint16_t)(a + 1), b}[k]);
+                      for (int k : {0, 1, 2}) idx.push_back(std::array<uint16_t, 3>{(uint16_t)(a + 1), (uint16_t)(b + 1), b}[k]);
+                  }
+              auto m = std::make_shared<Mesh>();
+              m->upload(v, idx);
+              return m;
+          }
+
+          Entity& Engine::add(const std::string& name, std::shared_ptr<Mesh> mesh, Vec3 pos, Vec3 color) {
+              auto e = std::make_unique<Entity>();
+              e->name = name; e->mesh = std::move(mesh); e->pos = pos; e->color = color;
+              entities_.push_back(std::move(e));
+              return *entities_.back();
+          }
+
+          bool Engine::init() {
+              entities_.clear();
+              time_ = 0;
+              if (!shader_.build(kVS, kFS)) return false;
+              glEnable(GL_DEPTH_TEST);
+              glEnable(GL_CULL_FACE);
+
+              auto cube = Mesh::cube();
+              auto sphere = Mesh::sphere();
+
+              // --- Cena demo ---
+              add("chao", cube, {0, -1.0f, 0}, {0.35f, 0.4f, 0.45f}).scale = {16, 0.2f, 16};
+
+              add("cubo", cube, {0, 0.2f, 0}, {0.9f, 0.35f, 0.3f}).onUpdate =
+                  [](Entity& e, float t, float dt) { e.rot.y += dt; e.rot.x = 0.4f * std::sin(t); };
+
+              add("esfera", sphere, {3, 0, 0}, {0.3f, 0.7f, 0.95f}).onUpdate =
+                  [](Entity& e, float t, float) { e.pos.y = 0.3f + 0.6f * std::sin(t * 2.0f); };
+
+              for (int i = 0; i < 4; ++i) {
+                  float base = i * 1.5708f;
+                  auto& s = add("sat" + std::to_string(i), cube, {}, {0.95f, 0.85f, 0.3f});
+                  s.scale = {0.4f, 0.4f, 0.4f};
+                  s.onUpdate = [base](Entity& e, float t, float) {
+                      e.pos = {5.5f * std::cos(t * 0.8f + base), 0, 5.5f * std::sin(t * 0.8f + base)};
+                      e.rot.y = t;
+                  };
+              }
+              return true;
+          }
+
+          void Engine::resize(int w, int h) {
+              w_ = std::max(w, 1); h_ = std::max(h, 1);
+              glViewport(0, 0, w_, h_);
+          }
+
+          void Engine::onDrag(float dx, float dy) {
+              camera.yaw -= dx * 0.008f;
+              camera.pitch = std::clamp(camera.pitch + dy * 0.008f, -1.4f, 1.4f);
+          }
+
+          void Engine::onZoom(float delta) {
+              camera.dist = std::clamp(camera.dist - delta * 0.02f, 2.5f, 30.0f);
+          }
+
+          void Engine::frame(float dt) {
+              dt = std::min(dt, 0.1f);
+              time_ += dt;
+              for (auto& e : entities_) if (e->onUpdate) e->onUpdate(*e, time_, dt);
+              render();
+          }
+
+          void Engine::render() {
+              glClearColor(0.08f, 0.09f, 0.12f, 1);
+              glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+              const Camera& c = camera;
+              Vec3 eye = c.target + Vec3{std::cos(c.pitch) * std::sin(c.yaw), std::sin(c.pitch),
+                                         std::cos(c.pitch) * std::cos(c.yaw)} * c.dist;
+              Mat4 vp = Mat4::perspective(c.fov, (float)w_ / h_, 0.1f, 100.0f) *
+                        Mat4::lookAt(eye, c.target, {0, 1, 0});
+
+              shader_.use();
+              glUniformMatrix4fv(shader_.loc("uVP"), 1, GL_FALSE, vp.m);
+              glUniform3f(shader_.loc("uLightDir"), lightDir.x, lightDir.y, lightDir.z);
+              GLint uModel = shader_.loc("uModel"), uColor = shader_.loc("uColor");
+              for (auto& e : entities_) {
+                  Mat4 m = e->model();
+                  glUniformMatrix4fv(uModel, 1, GL_FALSE, m.m);
+                  glUniform3f(uColor, e->color.x, e->color.y, e->color.z);
+                  e->mesh->draw();
+              }
+          }
+
+          } // namespace eng
+          EOF_FILE
+          mkdir -p app/src/main/cpp
+          cat > app/src/main/cpp/android_main.cpp <<'EOF_FILE'
+          #include <android/log.h>
+          #include <android_native_app_glue.h>
+          #include <EGL/egl.h>
+          #include <chrono>
+          #include <cmath>
+          #include "Engine.h"
+
+          struct App {
+              EGLDisplay dpy = EGL_NO_DISPLAY;
+              EGLSurface surf = EGL_NO_SURFACE;
+              EGLContext ctx = EGL_NO_CONTEXT;
+              eng::Engine engine;
+              bool ready = false;
+              int w = 0, h = 0;
+              float lastX = 0, lastY = 0, lastDist = 0;
+              int lastCount = 0;
+          };
+
+          static bool initEGL(App& s, ANativeWindow* win) {
+              s.dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+              eglInitialize(s.dpy, nullptr, nullptr);
+              const EGLint cfgAttr[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                                        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+                                        EGL_DEPTH_SIZE, 24, EGL_NONE};
+              EGLConfig cfg; EGLint n = 0;
+              if (!eglChooseConfig(s.dpy, cfgAttr, &cfg, 1, &n) || n < 1) return false;
+              s.surf = eglCreateWindowSurface(s.dpy, cfg, win, nullptr);
+              const EGLint ctxAttr[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+              s.ctx = eglCreateContext(s.dpy, cfg, EGL_NO_CONTEXT, ctxAttr);
+              if (!eglMakeCurrent(s.dpy, s.surf, s.surf, s.ctx)) return false;
+              return s.engine.init();
+          }
+
+          static void termEGL(App& s) {
+              s.ready = false;
+              if (s.dpy != EGL_NO_DISPLAY) {
+                  eglMakeCurrent(s.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                  if (s.ctx != EGL_NO_CONTEXT) eglDestroyContext(s.dpy, s.ctx);
+                  if (s.surf != EGL_NO_SURFACE) eglDestroySurface(s.dpy, s.surf);
+                  eglTerminate(s.dpy);
+              }
+              s.dpy = EGL_NO_DISPLAY; s.ctx = EGL_NO_CONTEXT; s.surf = EGL_NO_SURFACE;
+          }
+
+          static void onCmd(android_app* a, int32_t cmd) {
+              auto* s = (App*)a->userData;
+              if (cmd == APP_CMD_INIT_WINDOW && a->window) s->ready = initEGL(*s, a->window);
+              else if (cmd == APP_CMD_TERM_WINDOW) termEGL(*s);
+          }
+
+          static int32_t onInput(android_app* a, AInputEvent* e) {
+              if (AInputEvent_getType(e) != AINPUT_EVENT_TYPE_MOTION) return 0;
+              auto* s = (App*)a->userData;
+              int n = (int)AMotionEvent_getPointerCount(e);
+              int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK;
+              float x = AMotionEvent_getX(e, 0), y = AMotionEvent_getY(e, 0), dist = 0;
+              if (n >= 2) dist = std::hypot(AMotionEvent_getX(e, 1) - x, AMotionEvent_getY(e, 1) - y);
+
+              if (act == AMOTION_EVENT_ACTION_MOVE && n == s->lastCount) {
+                  if (n == 1) s->engine.onDrag(x - s->lastX, y - s->lastY);
+                  else if (n == 2) s->engine.onZoom(dist - s->lastDist);
+              }
+              s->lastX = x; s->lastY = y; s->lastDist = dist; s->lastCount = n;
+              if (act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_CANCEL) s->lastCount = 0;
+              return 1;
+          }
+
+          void android_main(android_app* app) {
+              App s;
+              app->userData = &s;
+              app->onAppCmd = onCmd;
+              app->onInputEvent = onInput;
+              auto last = std::chrono::steady_clock::now();
+
+              for (;;) {
+                  int events; android_poll_source* src;
+                  while (ALooper_pollOnce(s.ready ? 0 : -1, nullptr, &events, (void**)&src) >= 0) {
+                      if (src) src->process(app);
+                      if (app->destroyRequested) { termEGL(s); return; }
+                  }
+                  if (!s.ready) continue;
+
+                  EGLint w, h;
+                  eglQuerySurface(s.dpy, s.surf, EGL_WIDTH, &w);
+                  eglQuerySurface(s.dpy, s.surf, EGL_HEIGHT, &h);
+                  if (w != s.w || h != s.h) { s.w = w; s.h = h; s.engine.resize(w, h); }
+
+                  auto now = std::chrono::steady_clock::now();
+                  float dt = std::chrono::duration<float>(now - last).count();
+                  last = now;
+                  s.engine.frame(dt);
+                  eglSwapBuffers(s.dpy, s.surf);
+              }
+          }
+          EOF_FILE
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MobileEngine-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
